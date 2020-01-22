@@ -1,20 +1,23 @@
 #ifndef _NOSPEC_H_
 #define _NOSPEC_H_
 
+#define _GNU_SOURCE
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdlib.h>
 #include <memory.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <sys/resource.h>
 
-#include "module/ptedit_header.h"
+#include "context-light.h"
+#include "ptedit_header.h"
 
 #ifndef PARANOID
 #define PARANOID 0
 #endif
 
-#define DEBUG printf
+#define DEBUG //printf
 
 #define EI_NIDENT 16
 
@@ -48,6 +51,7 @@ typedef struct {
     uint64_t   sh_entsize;
 } Elf64_Shdr;
 
+void* recallocarray(void* addr, size_t oldnmemb, size_t nmemb, size_t size);
 
 #if PARANOID
 #include <signal.h>
@@ -80,6 +84,7 @@ uint64_t nospecrdtsc() {
   return a;
 }
 
+#ifndef NOSPEC_DISABLE
 void __attribute__((section(".specfence"), constructor)) init_nospec() {
     size_t start = nospecrdtsc();
     size_t stack = 0;
@@ -121,12 +126,15 @@ void __attribute__((section(".specfence"), constructor)) init_nospec() {
                 *(volatile char*)addr;
                 DEBUG(" - Setting %p to uncachable\n", addr);
                 ptedit_entry_t entry = ptedit_resolve(addr, 0);
+#if 1
                 entry.pte = ptedit_apply_mt(entry.pte, uc_mt);
+#else
+                entry.pte |= (1ull << 10);
+#endif
                 entry.valid = PTEDIT_VALID_MASK_PTE;
                 ptedit_update(addr, 0, &entry);
             }
         }
-
     }
 
 #if PARANOID
@@ -153,36 +161,119 @@ void __attribute__((section(".specfence"), constructor)) init_nospec() {
     signal(SIGSEGV, SIG_DFL);
 #endif
 
-    printf("[specfence] active, took %zd cycles\n", nospecrdtsc() - start);
+    printf("[context-light] active, took %zd cycles\n", nospecrdtsc() - start);
 
     ptedit_cleanup();
 }
 
-#define nospec __attribute__((section(".secret")))
+static int _nospec_secure_heap = 0;
+void nospec_secure_heap(int secure) {
+    _nospec_secure_heap = secure;
+}
+
+void nospec_set(void* addr, size_t len) {
+  size_t addr_aligned = (size_t)addr;
+  size_t first = addr_aligned & ~0xfff;
+  size_t last = (addr_aligned + len + 4095) & ~0xfff;
+  ptedit_init();
+  int uc_mt = ptedit_find_first_mt(PTEDIT_MT_UC);
+  if(uc_mt == -1) {
+    printf("[ERROR] Uncachable not supported on this kernel/machine\n");
+    ptedit_cleanup();
+  }
+  for(size_t j = first; j < last; j += 4096) {
+    *(volatile char*)j;
+
+    DEBUG(" - Setting %p to uncachable\n", j);
+    ptedit_entry_t entry = ptedit_resolve(j, 0);
+    entry.pte = ptedit_apply_mt(entry.pte, uc_mt);
+    entry.valid = PTEDIT_VALID_MASK_PTE;
+    ptedit_update(j, 0, &entry);
+  }
+  ptedit_cleanup();
+}
 
 void* malloc_nospec(size_t len) {
-    ptedit_init();
-    int uc_mt = ptedit_find_first_mt(PTEDIT_MT_UC);
-    if(uc_mt == -1) {
-        printf("[ERROR] Uncachable not supported on this kernel/machine\n");
-        ptedit_cleanup();
+    int uc_mt;
+    if(_nospec_secure_heap) {
+        ptedit_init();
+        uc_mt = ptedit_find_first_mt(PTEDIT_MT_UC);
+        if(uc_mt == -1) {
+            printf("[ERROR] Uncachable not supported on this kernel/machine\n");
+            ptedit_cleanup();
+        }
     }
     size_t len_aligned = ((len + 4095) / 4096) * 4096;
     void* mem = mmap(0, len_aligned + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-    for(int j = 1; j < len_aligned / 4096 + 1; j++) {
-        DEBUG(" - Setting %p to uncachable\n", mem + j * 4096);
-        ptedit_entry_t entry = ptedit_resolve(mem + j * 4096, 0);
-        entry.pte = ptedit_apply_mt(entry.pte, uc_mt);
-        entry.valid = PTEDIT_VALID_MASK_PTE;
-        ptedit_update(mem + j * 4096, 0, &entry);
+    if(_nospec_secure_heap) {
+        for(int j = 1; j < len_aligned / 4096 + 1; j++) {
+            DEBUG(" - Setting %p to uncachable\n", mem + j * 4096);
+            ptedit_entry_t entry = ptedit_resolve(mem + j * 4096, 0);
+            entry.pte = ptedit_apply_mt(entry.pte, uc_mt);
+            entry.valid = PTEDIT_VALID_MASK_PTE;
+            ptedit_update(mem + j * 4096, 0, &entry);
+        }
+        ptedit_cleanup();
     }
-    ptedit_cleanup();
     *(size_t*)mem = len;
+    *(((size_t*)mem) + 1) = 0xDEAD000E;
     return mem + 4096;
 }
 
-void free_nospec(void* addr) {
-    munmap((char*)addr - 4096, *(size_t*)((char*)addr - 4096));
+void* secure_malloc(size_t len) {
+  nospec_secure_heap(1);
+  void *mem = malloc(len);
+  nospec_secure_heap(0);
+
+  return mem;
 }
+
+void free_nospec(void* addr) {
+#ifdef OVERWRITE_MALLOC
+  if(!addr)
+    return;
+#endif
+  if(*(size_t*)((char*)addr - 4096 + sizeof(size_t)) == 0xDEAD000E) {
+    munmap((char*)addr - 4096, *(size_t*)((char*)addr - 4096));
+  } else {
+#ifndef OVERWRITE_MALLOC
+    free(addr);
+#endif
+  }
+}
+
+void* calloc_nospec(size_t nmemb, size_t size) {
+    void* res = malloc_nospec(nmemb * size);
+    memset(res, 0, nmemb * size);
+    return res;
+}
+
+void* realloc_nospec(void* addr, size_t size) {
+    if(*(size_t*)((char*)addr - 4096 + sizeof(size_t)) == 0xDEAD000E) {
+        size_t oldsize = *(size_t*)((char*)addr - 4096);
+        if(size < oldsize) return addr;
+        void* naddr = malloc_nospec(size);
+        memcpy(naddr, addr, oldsize <= size ? oldsize : size);
+        free_nospec(addr);
+        return naddr;
+    } else {
+        return realloc(addr, size);
+    }
+}
+
+void* reallocarray_nospec(void* addr, size_t nmemb, size_t size) {
+    return realloc_nospec(addr, nmemb * size);
+}
+
+void* recallocarray_nospec(void* addr, size_t oldnmemb, size_t nmemb, size_t size) {
+        if(nmemb < oldnmemb) return addr;
+
+        void* naddr = calloc_nospec(size * nmemb, 1);
+        memcpy(naddr, addr, ((oldnmemb <= nmemb) ? oldnmemb : nmemb) * size);
+        free_nospec(addr);
+        if(nmemb > oldnmemb) memset(naddr + size * oldnmemb, 0, size * (nmemb - oldnmemb));
+        return naddr;
+}
+#endif
 
 #endif

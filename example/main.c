@@ -6,7 +6,7 @@
 #include <unistd.h>
 
 #ifdef SECURE
-#include "../nospec.h"
+#include "../context-light.h"
 #endif
 
 size_t CACHE_MISS = 0;
